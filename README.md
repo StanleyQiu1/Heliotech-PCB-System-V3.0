@@ -35,7 +35,7 @@ Changes between versions should be documented whenever possible so that hardware
 **Project Status**\
 The system is under active development. PCB layouts, firmware, component selections, and system architecture may change as testing continues and new revisions are developed.
 
-**Team**\
+**Team**
 
 Developed as part of the TCHS HelioTech Solar Car Electrical Team.\
 **Lead Electrical Engineer: Stanley Qiu**
