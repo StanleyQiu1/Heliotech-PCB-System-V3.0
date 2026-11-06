@@ -37,5 +37,5 @@ The system is under active development. PCB layouts, firmware, component selecti
 
 **Team**
 
-Developed as part of the TCHS HelioTech Solar Car Electrical Team.
-Lead Electrical Engineer: Stanley Qiu
+Developed as part of the TCHS HelioTech Solar Car Electrical Team.\
+**Lead Electrical Engineer: Stanley Qiu**
