@@ -9,6 +9,7 @@
  * - HELIOTECH / Stanley Qiu screen once, then dashboard
  * - Fast line-batched SPI logo drawing at 8 MHz
  * - F1-style speedometer
+ * - One-time startup V8/V12-style LED bar rev test (visual only)
  * - LSM6DSL IMU
  * - 10 switches
  * - RS485 transmit and receive
@@ -115,6 +116,7 @@
 
 #define SPEED_BAR_SEGMENTS     20U
 #define SPEED_BAR_FULL_MPH     50U
+#define STARTUP_REV_DURATION_MS 3300U
 #define SPEED_MAX_MPH          300U
 
 #define TURN_BLINK_HALF_MS     400U
@@ -251,6 +253,12 @@ volatile uint32_t tft_refresh_count = 0U;
 volatile uint32_t tft_splash_shown = 0U;
 volatile uint32_t tft_dashboard_ready = 0U;
 volatile uint32_t tft_flash_phase = 0U;
+
+/* Startup LED bar demonstration, never used as vehicle speed input. */
+volatile uint32_t startup_rev_active = 0U;
+volatile uint32_t startup_rev_done = 0U;
+volatile uint32_t startup_rev_segments = 0U;
+static uint32_t startup_rev_start_ms = 0U;
 
 /* =====================================================
  * RS485 TRANSMISSION
@@ -3171,6 +3179,7 @@ static void TFT_ShowSplash(void);
 static void TFT_ShowStartupSequence(void);
 static void TFT_DrawStatic(void);
 static void TFT_Refresh(void);
+static uint8_t StartupRev_GetLevel(uint32_t elapsed_ms);
 
 static uint8_t ParseSpeedTenths(
     const char *value,
@@ -4000,7 +4009,80 @@ static void TFT_ShowStartupSequence(void)
 }
 
 /* =====================================================
- * F1 SPEED BAR
+ * ONE-TIME STARTUP BAR TEST (purely visual, NOT engine RPM)
+ * Simulates an idle, two short throttle blips, and a high rev.
+ * Each transition is linearly interpolated every TFT refresh.
+ * ===================================================== */
+
+typedef struct
+{
+    uint16_t time_ms;
+    uint8_t segments;
+} RevPoint;
+
+static const RevPoint startup_rev_curve[] =
+{
+    {   0U,  1U },  /* idle */
+    { 160U,  2U },
+    { 400U, 11U },  /* short rev */
+    { 530U, 13U },
+    { 730U,  4U },  /* release */
+    { 900U,  2U },
+    {1150U, 13U },  /* second rev */
+    {1350U, 18U },
+    {1500U, 10U },  /* blip */
+    {1680U, 19U },
+    {1850U,  5U },
+    {2070U,  2U },
+    {2380U, 18U },  /* final high rev */
+    {2500U, 20U },
+    {2630U, 16U },  /* small surge at the top */
+    {2750U, 20U },
+    {2920U, 12U },  /* throttle off */
+    {3110U,  4U },
+    {3300U,  0U }
+};
+
+static uint8_t StartupRev_GetLevel(uint32_t elapsed_ms)
+{
+    uint32_t curve_size = (uint32_t)(
+        sizeof(startup_rev_curve) / sizeof(startup_rev_curve[0])
+    );
+
+    if (elapsed_ms >= STARTUP_REV_DURATION_MS)
+    {
+        return 0U;
+    }
+
+    for (uint32_t i = 1U; i < curve_size; i++)
+    {
+        uint32_t t1 = startup_rev_curve[i].time_ms;
+
+        if (elapsed_ms <= t1)
+        {
+            uint32_t t0 = startup_rev_curve[i - 1U].time_ms;
+            uint32_t span = t1 - t0;
+            uint32_t into = elapsed_ms - t0;
+            uint32_t a = startup_rev_curve[i - 1U].segments;
+            uint32_t b = startup_rev_curve[i].segments;
+            uint32_t level = (
+                (a * (span - into)) + (b * into) + (span / 2U)
+            ) / span;
+
+            if (level > SPEED_BAR_SEGMENTS)
+            {
+                level = SPEED_BAR_SEGMENTS;
+            }
+
+            return (uint8_t)level;
+        }
+    }
+
+    return 0U;
+}
+
+/* =====================================================
+ * F1 SPEED BAR (update only segments that actually changed)
  * ===================================================== */
 
 static void TFT_DrawSpeedBar(uint8_t count)
@@ -4019,6 +4101,15 @@ static void TFT_DrawSpeedBar(uint8_t count)
 
     for (uint8_t i = 0U; i < SPEED_BAR_SEGMENTS; i++)
     {
+        /* Initial full draw; later only the LEDs that toggle. */
+        if (
+            previous != 255U &&
+            ((i < previous) == (i < count))
+        )
+        {
+            continue;
+        }
+
         uint16_t color =
             (i < 7U) ? 0x4000U :
             (i < 13U) ? 0x4200U : 0x0240U;
@@ -4422,7 +4513,7 @@ static void TFT_DrawStatic(void)
 
     TFT_Text(
         219U, 40U,
-        "GILBERT.V3",
+        "GILBERT V3.0",
         2U,
         TFT_WHITE,
         TFT_PANEL
@@ -4550,6 +4641,10 @@ static void TFT_DrawStatic(void)
         TFT_BG
     );
 
+    startup_rev_start_ms = HAL_GetTick();
+    startup_rev_active = 1U;
+    startup_rev_done = 0U;
+    startup_rev_segments = 0U;
     tft_dashboard_ready = 1U;
 }
 
@@ -4662,6 +4757,28 @@ static void TFT_Refresh(void)
         }
 
         ledCount = (uint8_t)n;
+    }
+
+    /* Visual startup self-test: speed digits still show real RS-485 data.
+     * Abort automatically if real nonzero vehicle speed arrives. */
+    if (startup_rev_active != 0U)
+    {
+        uint32_t elapsed = (uint32_t)(now - startup_rev_start_ms);
+
+        if (
+            elapsed >= STARTUP_REV_DURATION_MS ||
+            (speed_valid != 0U && speed_tenths > 0U)
+        )
+        {
+            startup_rev_active = 0U;
+            startup_rev_done = 1U;
+            startup_rev_segments = 0U;
+        }
+        else
+        {
+            ledCount = StartupRev_GetLevel(elapsed);
+            startup_rev_segments = (uint32_t)ledCount;
+        }
     }
 
     TFT_DrawSpeedBar(ledCount);
