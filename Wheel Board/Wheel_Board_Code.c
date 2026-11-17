@@ -1,0 +1,3727 @@
+
+/*
+ * HELIOTECH WHEEL PCB V3.0 - STM32G071KBTxN
+ * Complete Core/Src/main.c
+ *
+ * FEATURES:
+ * - ST7796S 480x320 TFT
+ * - HELIOTECH startup screen
+ * - F1-style speedometer
+ * - LSM6DSL IMU
+ * - 10 switches
+ * - RS485 transmit and receive
+ * - Self-canceling LEFT/RIGHT turn signals
+ * - RADIO push-to-talk (PTT), NOT toggle
+ *
+ * HARDWARE:
+ *
+ * TFT:
+ * PA5 SPI1 SCK
+ * PA7 SPI1 MOSI
+ * PD3 TFT CS
+ * PB15 TFT DC
+ * PB9 TFT RESET
+ *
+ * IMU:
+ * PA4 CS
+ * PA5 SPI1 SCK
+ * PA6 SPI1 MISO
+ * PA7 SPI1 MOSI
+ *
+ * MAX3485:
+ * PA1 DE and /RE
+ * PA2 USART2 TX
+ * PA3 USART2 RX
+ *
+ * SWITCHES:
+ * 1 LEFT       PA10
+ * 2 RIGHT      PA8
+ * 3 HAZARD     PB8
+ * 4 HORN       PA11
+ * 5 HEADLIGHT  PA0
+ * 6 RADIO/PTT  PC6
+ * 7 BACK       PC15
+ * 8 NEXT       PC14
+ * 9 PH1        PB6
+ * 10 FAN       PB7
+ *
+ * SWITCH BEHAVIOR:
+ *
+ * LEFT/RIGHT/HAZARD/HEADLIGHT/PH1/FAN:
+ * Toggle on each press.
+ *
+ * HORN/BACK/NEXT/RADIO:
+ * Momentary while physically pressed.
+ *
+ * RADIO PTT:
+ * PRESS  -> PTT ON
+ * RELEASE -> PTT OFF
+ *
+ * RS485 BUTTON MESSAGE:
+ * B,time,id,name,pressed,mask
+ *
+ * RS485 SPEED MESSAGE:
+ * S,35.8
+ *
+ * Incoming system status:
+ * SYS,008
+ *
+ * Turn-signal flashing:
+ * 400ms ON / 400ms OFF.
+ *
+ * Auto-cancel:
+ * Turn 65 degrees and return within 18 degrees.
+ */
+
+#include "main.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+#include <stddef.h>
+
+/* =====================================================
+ * CONFIGURATION
+ * ===================================================== */
+
+#define SWITCH_COUNT           10U
+#define SWITCH_SCAN_MS         5U
+#define SWITCH_DEBOUNCE_MS     25U
+
+#define IMU_SAMPLE_MS          20U
+#define IMU_RETRY_MS           1000U
+#define ORIENTATION_SEND_MS    100U
+#define GYRO_CAL_SAMPLES       50U
+
+#define YAW_RATE_DEADBAND_DPS  0.80f
+#define STILL_GYRO_DPS        1.00f
+#define STILL_ACCEL_G_TOL     0.07f
+#define STILL_CONFIRM_MS      300U
+#define GYRO_BIAS_LEARN_RATE   0.005f
+
+#define RS485_RX_LINE_SIZE     96U
+#define RS485_RX_QUEUE_SIZE    4U
+#define UART_BAUD              115200U
+
+#define PI_TO_DEG              57.2957795f
+
+#define TFT_REFRESH_MS         80U
+#define TFT_SPLASH_MS          2200U
+
+#define SPEED_TIMEOUT_MS       1500U
+#define SYSTEM_TIMEOUT_MS      1500U
+
+#define SPEED_BAR_SEGMENTS     20U
+#define SPEED_BAR_FULL_MPH     50U
+#define SPEED_MAX_MPH          300U
+
+#define TURN_BLINK_HALF_MS     400U
+
+#define TURN_ARM_DEG           65.0f
+#define TURN_RETURN_DEG        18.0f
+#define TURN_MIN_ACTIVE_MS     400U
+
+/* TFT dimensions */
+
+#define TFT_WIDTH              480U
+#define TFT_HEIGHT             320U
+
+/* RGB565 colors */
+
+#define TFT_BG                 0x0841U
+#define TFT_PANEL              0x1082U
+#define TFT_WHITE              0xFFFFU
+#define TFT_CYAN               0x07FFU
+#define TFT_GREEN              0x07E0U
+#define TFT_ORANGE             0xFD20U
+#define TFT_GRAY               0xB596U
+#define TFT_OFF                0x528AU
+#define TFT_RED                0xF800U
+#define TFT_YELLOW             0xFFE0U
+#define TFT_AMBER              0xFCE0U
+#define TFT_DARK_LED           0x2144U
+#define TFT_BLACK              0x0000U
+
+/* LSM6DSL registers */
+
+#define IMU_WHO_AM_I_REG       0x0FU
+#define IMU_CTRL1_XL_REG      0x10U
+#define IMU_CTRL2_G_REG       0x11U
+#define IMU_CTRL3_C_REG       0x12U
+#define IMU_OUTX_L_G_REG      0x22U
+#define IMU_EXPECTED_ID       0x6AU
+
+/* =====================================================
+ * PERIPHERAL HANDLES
+ * ===================================================== */
+
+SPI_HandleTypeDef hspi1;
+UART_HandleTypeDef huart2;
+
+/* =====================================================
+ * IMU DEBUG VARIABLES
+ * ===================================================== */
+
+volatile uint32_t imu_ok = 0U;
+volatile uint32_t imu_whoami = 0U;
+volatile uint32_t imu_samples = 0U;
+volatile uint32_t imu_errors = 0U;
+volatile uint32_t imu_last_hal_status = 0U;
+
+volatile int16_t imu_ax_raw = 0;
+volatile int16_t imu_ay_raw = 0;
+volatile int16_t imu_az_raw = 0;
+
+volatile int16_t imu_gx_raw = 0;
+volatile int16_t imu_gy_raw = 0;
+volatile int16_t imu_gz_raw = 0;
+
+volatile float imu_ax_g = 0.0f;
+volatile float imu_ay_g = 0.0f;
+volatile float imu_az_g = 0.0f;
+
+volatile float imu_gx_dps = 0.0f;
+volatile float imu_gy_dps = 0.0f;
+volatile float imu_gz_dps = 0.0f;
+
+/* =====================================================
+ * ORIENTATION
+ * ===================================================== */
+
+volatile float imu_roll_deg = 0.0f;
+volatile float imu_pitch_deg = 0.0f;
+volatile float imu_yaw_deg = 0.0f;
+
+volatile float gyro_bias_x_dps = 0.0f;
+volatile float gyro_bias_y_dps = 0.0f;
+volatile float gyro_bias_z_dps = 0.0f;
+
+volatile uint32_t imu_orientation_valid = 0U;
+volatile uint32_t gyro_cal_samples = 0U;
+volatile uint32_t imu_stationary = 0U;
+
+volatile float imu_yaw_rate_dps = 0.0f;
+volatile float imu_yaw_total_deg = 0.0f;
+
+/* =====================================================
+ * AUTOMATIC TURN CANCEL
+ * ===================================================== */
+
+volatile uint32_t turn_cancel_side = 0U;
+volatile uint32_t turn_cancel_armed = 0U;
+volatile uint32_t turn_cancel_count = 0U;
+volatile uint32_t turn_cancel_last_side = 0U;
+volatile uint32_t turn_cancel_tx_errors = 0U;
+
+volatile float turn_cancel_yaw_delta_deg = 0.0f;
+volatile float turn_cancel_peak_deg = 0.0f;
+
+/* =====================================================
+ * SWITCH DEBUG VARIABLES
+ * ===================================================== */
+
+volatile uint32_t sw_left = 0U;
+volatile uint32_t sw_right = 0U;
+volatile uint32_t sw_hazard = 0U;
+volatile uint32_t sw_horn = 0U;
+volatile uint32_t sw_headlights = 0U;
+
+volatile uint32_t sw_radio = 0U;
+volatile uint32_t sw_back = 0U;
+volatile uint32_t sw_next = 0U;
+volatile uint32_t sw_ph1 = 0U;
+volatile uint32_t sw_fan = 0U;
+
+volatile uint32_t sw_pressed_mask = 0U;
+volatile uint32_t sw_event_count = 0U;
+volatile uint32_t sw_last_pressed = 0U;
+
+volatile uint32_t sw_press_count[SWITCH_COUNT] = {0U};
+
+/* =====================================================
+ * TFT DEBUG
+ * ===================================================== */
+
+volatile uint32_t tft_initialized = 0U;
+volatile uint32_t tft_spi_errors = 0U;
+volatile uint32_t tft_refresh_count = 0U;
+
+volatile uint32_t tft_splash_shown = 0U;
+volatile uint32_t tft_dashboard_ready = 0U;
+volatile uint32_t tft_flash_phase = 0U;
+
+/* =====================================================
+ * RS485 TRANSMISSION
+ * ===================================================== */
+
+volatile uint32_t rs485_tx_count = 0U;
+volatile uint32_t rs485_tx_errors = 0U;
+volatile uint32_t rs485_last_hal_status = 0U;
+
+volatile uint32_t rs485_last_message_type = 0U;
+volatile uint32_t rs485_button_packets = 0U;
+volatile uint32_t rs485_orientation_packets = 0U;
+
+volatile uint32_t rs485_de_state = 0U;
+volatile uint32_t rs485_last_button_id = 0U;
+volatile uint32_t rs485_last_button_state = 0U;
+
+volatile char rs485_last_message[96] = {0};
+volatile char rs485_last_button_message[96] = {0};
+
+/* =====================================================
+ * RS485 RECEPTION
+ * ===================================================== */
+
+volatile uint32_t rs485_rx_bytes = 0U;
+volatile uint32_t rs485_rx_count = 0U;
+volatile uint32_t rs485_rx_errors = 0U;
+volatile uint32_t rs485_rx_dropped = 0U;
+volatile uint32_t rs485_rx_line_overflows = 0U;
+
+volatile uint32_t rs485_zero_yaw_commands = 0U;
+volatile uint32_t rs485_ping_commands = 0U;
+
+volatile char rs485_last_rx_message[RS485_RX_LINE_SIZE] = {0};
+
+/* =====================================================
+ * SPEED
+ * ===================================================== */
+
+volatile uint32_t speed_tenths = 0U;
+volatile float speed_mph = 0.0f;
+volatile uint32_t speed_valid = 0U;
+volatile uint32_t speed_rx_packets = 0U;
+volatile uint32_t speed_parse_errors = 0U;
+volatile uint32_t speed_last_rx_ms = 0U;
+
+/* =====================================================
+ * SYSTEM STATE
+ * ===================================================== */
+
+volatile uint32_t remote_system_mask = 0U;
+volatile uint32_t remote_system_packets = 0U;
+volatile uint32_t remote_system_last_ms = 0U;
+
+volatile uint32_t local_latched_mask = 0U;
+volatile uint32_t display_system_mask = 0U;
+volatile uint32_t display_system_remote = 0U;
+
+/* =====================================================
+ * UART RX QUEUE
+ * ===================================================== */
+
+static uint8_t rs485_rx_irq_byte = 0U;
+
+static volatile char
+rs485_rx_build[RS485_RX_LINE_SIZE] = {0};
+
+static volatile uint8_t rs485_rx_build_length = 0U;
+static volatile uint8_t rs485_rx_discard_line = 0U;
+
+static volatile char
+rs485_rx_queue[RS485_RX_QUEUE_SIZE][RS485_RX_LINE_SIZE];
+
+static volatile uint8_t rs485_rx_queue_head = 0U;
+static volatile uint8_t rs485_rx_queue_tail = 0U;
+
+/* =====================================================
+ * BUTTON PIN TABLE
+ * ===================================================== */
+
+typedef struct
+{
+    GPIO_TypeDef *port;
+    uint16_t pin;
+    const char *name;
+} ButtonPin;
+
+static const ButtonPin buttons[SWITCH_COUNT] =
+{
+    {GPIOA, GPIO_PIN_10, "LEFT"},
+    {GPIOA, GPIO_PIN_8,  "RIGHT"},
+    {GPIOB, GPIO_PIN_8,  "HAZARD"},
+    {GPIOA, GPIO_PIN_11, "HORN"},
+    {GPIOA, GPIO_PIN_0,  "HEADLIGHT"},
+    {GPIOC, GPIO_PIN_6,  "RADIO"},
+    {GPIOC, GPIO_PIN_15, "BACK"},
+    {GPIOC, GPIO_PIN_14, "NEXT"},
+    {GPIOB, GPIO_PIN_6,  "PH1"},
+    {GPIOB, GPIO_PIN_7,  "FAN"}
+};
+
+/* =====================================================
+ * INTERNAL STATE
+ * ===================================================== */
+
+static uint8_t sw_last_raw[SWITCH_COUNT] = {0U};
+static uint8_t sw_stable[SWITCH_COUNT] = {0U};
+
+static uint32_t sw_last_change_ms[SWITCH_COUNT] = {0U};
+
+static float gyro_bias_sum_x = 0.0f;
+static float gyro_bias_sum_y = 0.0f;
+static float gyro_bias_sum_z = 0.0f;
+
+static uint32_t last_orientation_ms = 0U;
+static uint32_t gyro_still_start_ms = 0U;
+
+static uint32_t turn_start_ms = 0U;
+static float turn_start_yaw_deg = 0.0f;
+static uint8_t turn_waiting_for_imu = 0U;
+
+/* =====================================================
+ * FUNCTION DECLARATIONS
+ * ===================================================== */
+
+void SystemClock_Config(void);
+
+static void Board_GPIO_Init(void);
+static void Board_SPI1_Init(void);
+static void Board_USART2_Init(void);
+
+static uint8_t IMU_Init(void);
+static uint8_t IMU_ReadMotion(void);
+static void Orientation_Update(void);
+
+static uint8_t RS485_Send(
+    const char *message,
+    uint32_t message_type
+);
+
+static void RS485_SendButton(
+    uint8_t index,
+    uint8_t pressed
+);
+
+static void RS485_SendOrientation(void);
+static void RS485_ProcessReceived(void);
+
+static void TurnCancel_Stop(void);
+static void TurnCancel_Start(uint8_t side);
+static void TurnCancel_Update(void);
+
+static uint8_t TurnCancel_SendVirtualButton(
+    uint8_t index,
+    uint8_t pressed
+);
+
+static void TFT_Init(void);
+static void TFT_ShowSplash(void);
+static void TFT_DrawStatic(void);
+static void TFT_Refresh(void);
+
+static uint8_t ParseSpeedTenths(
+    const char *value,
+    uint32_t *tenths
+);
+
+static uint8_t ParseHexMask(
+    const char *value,
+    uint32_t *mask
+);
+
+/* =====================================================
+ * TFT LOW-LEVEL SPI
+ * ===================================================== */
+
+static void TFT_SPIWrite(
+    const uint8_t *data,
+    uint16_t length
+)
+{
+    if (
+        HAL_SPI_Transmit(
+            &hspi1,
+            (uint8_t *)data,
+            length,
+            100U
+        ) != HAL_OK
+    )
+    {
+        tft_spi_errors++;
+    }
+}
+
+static void TFT_Select(void)
+{
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_4,
+        GPIO_PIN_SET
+    );
+
+    HAL_GPIO_WritePin(
+        GPIOD,
+        GPIO_PIN_3,
+        GPIO_PIN_RESET
+    );
+}
+
+static void TFT_Deselect(void)
+{
+    HAL_GPIO_WritePin(
+        GPIOD,
+        GPIO_PIN_3,
+        GPIO_PIN_SET
+    );
+}
+
+static void TFT_SetDC(uint8_t dataMode)
+{
+    HAL_GPIO_WritePin(
+        GPIOB,
+        GPIO_PIN_15,
+        dataMode ? GPIO_PIN_SET : GPIO_PIN_RESET
+    );
+}
+
+static void TFT_Cmd(
+    uint8_t cmd,
+    const uint8_t *data,
+    uint8_t count
+)
+{
+    TFT_Select();
+
+    TFT_SetDC(0U);
+    TFT_SPIWrite(&cmd, 1U);
+
+    if (count > 0U && data != NULL)
+    {
+        TFT_SetDC(1U);
+        TFT_SPIWrite(data, count);
+    }
+
+    TFT_Deselect();
+}
+
+static void TFT_Cmd1(
+    uint8_t cmd,
+    uint8_t value
+)
+{
+    TFT_Cmd(cmd, &value, 1U);
+}
+
+static void TFT_BeginWindow(
+    uint16_t x0,
+    uint16_t y0,
+    uint16_t x1,
+    uint16_t y1
+)
+{
+    uint8_t params[4];
+    uint8_t cmd;
+
+    TFT_Select();
+
+    cmd = 0x2AU;
+    TFT_SetDC(0U);
+    TFT_SPIWrite(&cmd, 1U);
+
+    params[0] = (uint8_t)(x0 >> 8);
+    params[1] = (uint8_t)x0;
+    params[2] = (uint8_t)(x1 >> 8);
+    params[3] = (uint8_t)x1;
+
+    TFT_SetDC(1U);
+    TFT_SPIWrite(params, 4U);
+
+    cmd = 0x2BU;
+    TFT_SetDC(0U);
+    TFT_SPIWrite(&cmd, 1U);
+
+    params[0] = (uint8_t)(y0 >> 8);
+    params[1] = (uint8_t)y0;
+    params[2] = (uint8_t)(y1 >> 8);
+    params[3] = (uint8_t)y1;
+
+    TFT_SetDC(1U);
+    TFT_SPIWrite(params, 4U);
+
+    cmd = 0x2CU;
+    TFT_SetDC(0U);
+    TFT_SPIWrite(&cmd, 1U);
+
+    TFT_SetDC(1U);
+}
+
+static void TFT_FillRect(
+    uint16_t x,
+    uint16_t y,
+    uint16_t w,
+    uint16_t h,
+    uint16_t rgb565
+)
+{
+    uint8_t buffer[512];
+    uint32_t pixels;
+
+    uint8_t hi = (uint8_t)(rgb565 >> 8);
+    uint8_t lo = (uint8_t)rgb565;
+
+    if (
+        x >= TFT_WIDTH ||
+        y >= TFT_HEIGHT ||
+        w == 0U ||
+        h == 0U
+    )
+    {
+        return;
+    }
+
+    if (w > TFT_WIDTH - x)
+    {
+        w = TFT_WIDTH - x;
+    }
+
+    if (h > TFT_HEIGHT - y)
+    {
+        h = TFT_HEIGHT - y;
+    }
+
+    for (
+        uint16_t i = 0U;
+        i < sizeof(buffer);
+        i += 2U
+    )
+    {
+        buffer[i] = hi;
+        buffer[i + 1U] = lo;
+    }
+
+    TFT_BeginWindow(
+        x,
+        y,
+        (uint16_t)(x + w - 1U),
+        (uint16_t)(y + h - 1U)
+    );
+
+    pixels = (uint32_t)w * (uint32_t)h;
+
+    while (pixels > 0U)
+    {
+        uint16_t chunk =
+            pixels > 256U ? 256U : (uint16_t)pixels;
+
+        TFT_SPIWrite(
+            buffer,
+            (uint16_t)(chunk * 2U)
+        );
+
+        pixels -= chunk;
+    }
+
+    TFT_Deselect();
+}
+
+/* =====================================================
+ * FONT DATA
+ * ===================================================== */
+
+static const uint8_t font_digits[10][5] =
+{
+    {0x3E, 0x51, 0x49, 0x45, 0x3E},
+    {0x00, 0x42, 0x7F, 0x40, 0x00},
+    {0x42, 0x61, 0x51, 0x49, 0x46},
+    {0x21, 0x41, 0x45, 0x4B, 0x31},
+    {0x18, 0x14, 0x12, 0x7F, 0x10},
+    {0x27, 0x45, 0x45, 0x45, 0x39},
+    {0x3C, 0x4A, 0x49, 0x49, 0x30},
+    {0x01, 0x71, 0x09, 0x05, 0x03},
+    {0x36, 0x49, 0x49, 0x49, 0x36},
+    {0x06, 0x49, 0x49, 0x29, 0x1E}
+};
+
+static const uint8_t font_letters[26][5] =
+{
+    {0x7E, 0x11, 0x11, 0x11, 0x7E},
+    {0x7F, 0x49, 0x49, 0x49, 0x36},
+    {0x3E, 0x41, 0x41, 0x41, 0x22},
+    {0x7F, 0x41, 0x41, 0x22, 0x1C},
+    {0x7F, 0x49, 0x49, 0x49, 0x41},
+    {0x7F, 0x09, 0x09, 0x09, 0x01},
+    {0x3E, 0x41, 0x49, 0x49, 0x7A},
+    {0x7F, 0x08, 0x08, 0x08, 0x7F},
+    {0x00, 0x41, 0x7F, 0x41, 0x00},
+    {0x20, 0x40, 0x41, 0x3F, 0x01},
+    {0x7F, 0x08, 0x14, 0x22, 0x41},
+    {0x7F, 0x40, 0x40, 0x40, 0x40},
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F},
+    {0x7F, 0x04, 0x08, 0x10, 0x7F},
+    {0x3E, 0x41, 0x41, 0x41, 0x3E},
+    {0x7F, 0x09, 0x09, 0x09, 0x06},
+    {0x3E, 0x41, 0x51, 0x21, 0x5E},
+    {0x7F, 0x09, 0x19, 0x29, 0x46},
+    {0x46, 0x49, 0x49, 0x49, 0x31},
+    {0x01, 0x01, 0x7F, 0x01, 0x01},
+    {0x3F, 0x40, 0x40, 0x40, 0x3F},
+    {0x1F, 0x20, 0x40, 0x20, 0x1F},
+    {0x3F, 0x40, 0x38, 0x40, 0x3F},
+    {0x63, 0x14, 0x08, 0x14, 0x63},
+    {0x07, 0x08, 0x70, 0x08, 0x07},
+    {0x61, 0x51, 0x49, 0x45, 0x43}
+};
+
+static const uint8_t font_lower[26][5] =
+{
+    {0x20,0x54,0x54,0x54,0x78},
+    {0x7F,0x48,0x44,0x44,0x38},
+    {0x38,0x44,0x44,0x44,0x20},
+    {0x38,0x44,0x44,0x48,0x7F},
+    {0x38,0x54,0x54,0x54,0x18},
+    {0x08,0x7E,0x09,0x01,0x02},
+    {0x08,0x54,0x54,0x54,0x3C},
+    {0x7F,0x08,0x04,0x04,0x78},
+    {0x00,0x44,0x7D,0x40,0x00},
+    {0x20,0x40,0x44,0x3D,0x00},
+    {0x7F,0x10,0x28,0x44,0x00},
+    {0x00,0x41,0x7F,0x40,0x00},
+    {0x7C,0x04,0x18,0x04,0x78},
+    {0x7C,0x08,0x04,0x04,0x78},
+    {0x38,0x44,0x44,0x44,0x38},
+    {0x7C,0x14,0x14,0x14,0x08},
+    {0x08,0x14,0x14,0x18,0x7C},
+    {0x7C,0x08,0x04,0x04,0x08},
+    {0x48,0x54,0x54,0x54,0x20},
+    {0x04,0x3F,0x44,0x40,0x20},
+    {0x3C,0x40,0x40,0x20,0x7C},
+    {0x1C,0x20,0x40,0x20,0x1C},
+    {0x3C,0x40,0x30,0x40,0x3C},
+    {0x44,0x28,0x10,0x28,0x44},
+    {0x0C,0x50,0x50,0x50,0x3C},
+    {0x44,0x64,0x54,0x4C,0x44}
+};
+
+/* =====================================================
+ * FONT RENDERING
+ * ===================================================== */
+
+static void TFT_GetGlyph(char c, uint8_t glyph[5])
+{
+    if (c >= 'a' && c <= 'z')
+    {
+        memcpy(glyph, font_lower[c - 'a'], 5U);
+        return;
+    }
+
+    if (c >= '0' && c <= '9')
+    {
+        memcpy(glyph, font_digits[c - '0'], 5U);
+        return;
+    }
+
+    if (c >= 'A' && c <= 'Z')
+    {
+        memcpy(glyph, font_letters[c - 'A'], 5U);
+        return;
+    }
+
+    memset(glyph, 0U, 5U);
+
+    switch (c)
+    {
+        case '-':
+            glyph[0] = glyph[1] = glyph[2] =
+            glyph[3] = glyph[4] = 0x08U;
+            break;
+
+        case '.':
+            glyph[2] = 0x60U;
+            break;
+
+        case ':':
+            glyph[2] = 0x36U;
+            break;
+
+        case '+':
+            glyph[0] = 0x08U;
+            glyph[1] = 0x08U;
+            glyph[2] = 0x3EU;
+            glyph[3] = 0x08U;
+            glyph[4] = 0x08U;
+            break;
+
+        case '/':
+            glyph[0] = 0x20U;
+            glyph[1] = 0x10U;
+            glyph[2] = 0x08U;
+            glyph[3] = 0x04U;
+            glyph[4] = 0x02U;
+            break;
+
+        case '!':
+            glyph[2] = 0x5FU;
+            break;
+
+        case '=':
+            glyph[0] = glyph[1] = glyph[2] =
+            glyph[3] = glyph[4] = 0x14U;
+            break;
+
+        case '?':
+            glyph[0] = 0x02U;
+            glyph[1] = 0x01U;
+            glyph[2] = 0x51U;
+            glyph[3] = 0x09U;
+            glyph[4] = 0x06U;
+            break;
+
+        default:
+            break;
+    }
+}
+
+static uint8_t tftGlyphScanline[6U * 10U * 10U * 2U];
+
+static void TFT_DrawChar(
+    uint16_t x,
+    uint16_t y,
+    char c,
+    uint8_t scale,
+    uint16_t fg,
+    uint16_t bg
+)
+{
+    uint8_t glyph[5];
+
+    if (scale == 0U || scale > 10U)
+    {
+        return;
+    }
+
+    uint16_t w = (uint16_t)(6U * scale);
+    uint16_t h = (uint16_t)(8U * scale);
+
+    if (
+        x + w > TFT_WIDTH ||
+        y + h > TFT_HEIGHT
+    )
+    {
+        return;
+    }
+
+    TFT_GetGlyph(c, glyph);
+
+    TFT_BeginWindow(
+        x,
+        y,
+        (uint16_t)(x + w - 1U),
+        (uint16_t)(y + h - 1U)
+    );
+
+    for (uint16_t glyphRow = 0U; glyphRow < 8U; glyphRow++)
+    {
+        uint16_t k = 0U;
+
+        for (uint16_t repetition = 0U; repetition < scale; repetition++)
+        {
+            for (uint16_t xx = 0U; xx < w; xx++)
+            {
+                uint16_t glyphCol = xx / scale;
+                uint16_t color = bg;
+
+                if (
+                    glyphCol < 5U &&
+                    glyphRow < 7U &&
+                    (glyph[glyphCol] & (1U << glyphRow)) != 0U
+                )
+                {
+                    color = fg;
+                }
+
+                tftGlyphScanline[k++] = (uint8_t)(color >> 8);
+                tftGlyphScanline[k++] = (uint8_t)color;
+            }
+        }
+
+        TFT_SPIWrite(tftGlyphScanline, k);
+    }
+
+    TFT_Deselect();
+}
+
+static void TFT_Text(
+    uint16_t x,
+    uint16_t y,
+    const char *s,
+    uint8_t scale,
+    uint16_t color,
+    uint16_t background
+)
+{
+    if (s == NULL)
+    {
+        return;
+    }
+
+    while (*s != '\0' && x + 6U * scale <= TFT_WIDTH)
+    {
+        TFT_DrawChar(
+            x,
+            y,
+            *s,
+            scale,
+            color,
+            background
+        );
+
+        x = (uint16_t)(x + 6U * scale);
+        s++;
+    }
+}
+
+static void TFT_TextChanged(
+    uint16_t x,
+    uint16_t y,
+    const char *text,
+    char *cache,
+    size_t cacheSize,
+    uint8_t scale,
+    uint16_t color,
+    uint16_t bg
+)
+{
+    size_t oldLen = strlen(cache);
+    size_t newLen = strlen(text);
+
+    size_t n = (oldLen > newLen) ? oldLen : newLen;
+
+    if (n >= cacheSize)
+    {
+        n = cacheSize - 1U;
+    }
+
+    for (size_t i = 0U; i < n; i++)
+    {
+        char oldC = (i < oldLen) ? cache[i] : ' ';
+        char newC = (i < newLen) ? text[i] : ' ';
+
+        if (newC != oldC)
+        {
+            TFT_DrawChar(
+                (uint16_t)(x + (uint16_t)i * 6U * scale),
+                y,
+                newC,
+                scale,
+                color,
+                bg
+            );
+        }
+    }
+
+    size_t copyLen = newLen;
+
+    if (copyLen >= cacheSize)
+    {
+        copyLen = cacheSize - 1U;
+    }
+
+    memcpy(cache, text, copyLen);
+    cache[copyLen] = '\0';
+}
+
+static void TFT_FormatAngle(
+    char *out,
+    size_t size,
+    float degrees
+)
+{
+    char temp[12];
+    uint8_t k = 0U;
+    uint8_t negative = 0U;
+
+    if (out == NULL || size == 0U)
+    {
+        return;
+    }
+
+    if (isnan(degrees))
+    {
+        degrees = 0.0f;
+    }
+
+    if (degrees > 999.99f)
+    {
+        degrees = 999.99f;
+    }
+
+    if (degrees < -999.99f)
+    {
+        degrees = -999.99f;
+    }
+
+    if (degrees < 0.0f)
+    {
+        negative = 1U;
+        degrees = -degrees;
+    }
+
+    uint32_t cd = (uint32_t)(degrees * 100.0f);
+    uint32_t whole = cd / 100U;
+    uint32_t frac = cd % 100U;
+
+    if (negative)
+    {
+        temp[k++] = '-';
+    }
+
+    if (whole >= 100U)
+    {
+        temp[k++] = (char)('0' + (whole / 100U) % 10U);
+    }
+
+    if (whole >= 10U)
+    {
+        temp[k++] = (char)('0' + (whole / 10U) % 10U);
+    }
+
+    temp[k++] = (char)('0' + whole % 10U);
+    temp[k++] = '.';
+    temp[k++] = (char)('0' + frac / 10U);
+    temp[k++] = (char)('0' + frac % 10U);
+    temp[k] = '\0';
+
+    if ((size_t)k >= size)
+    {
+        k = (uint8_t)(size - 1U);
+    }
+
+    memcpy(out, temp, k);
+    out[k] = '\0';
+}
+
+/* =====================================================
+ * TFT INITIALIZATION
+ * ===================================================== */
+
+static void TFT_Init(void)
+{
+    static const uint8_t b6[3] =
+    {
+        0x80U,
+        0x02U,
+        0x3BU
+    };
+
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+    TFT_Deselect();
+    TFT_SetDC(1U);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+    HAL_Delay(25U);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_Delay(150U);
+
+    TFT_Cmd(0x01U, NULL, 0U);
+    HAL_Delay(150U);
+
+    TFT_Cmd1(0xF0U, 0xC3U);
+    TFT_Cmd1(0xF0U, 0x96U);
+    TFT_Cmd1(0xC5U, 0x1CU);
+
+    /* Landscape: 90 degrees clockwise */
+
+    TFT_Cmd1(0x36U, 0x28U);
+
+    /* 16-bit RGB565 */
+
+    TFT_Cmd1(0x3AU, 0x55U);
+
+    TFT_Cmd1(0xB0U, 0x80U);
+    TFT_Cmd1(0xB4U, 0x00U);
+    TFT_Cmd(0xB6U, b6, 3U);
+    TFT_Cmd1(0xB7U, 0xC6U);
+
+    TFT_Cmd1(0xF0U, 0x69U);
+    TFT_Cmd1(0xF0U, 0x3CU);
+
+    TFT_Cmd(0x11U, NULL, 0U);
+    HAL_Delay(150U);
+
+    TFT_Cmd(0x29U, NULL, 0U);
+    HAL_Delay(30U);
+
+    tft_initialized = 1U;
+}
+
+/* =====================================================
+ * SPLASH SCREEN
+ * ===================================================== */
+
+static void TFT_CenteredText(
+    uint16_t y,
+    const char *text,
+    uint8_t scale,
+    uint16_t color,
+    uint16_t bg
+)
+{
+    uint32_t width =
+        (uint32_t)strlen(text) * 6U * scale;
+
+    uint16_t x = 0U;
+
+    if (width < TFT_WIDTH)
+    {
+        x = (uint16_t)((TFT_WIDTH - width) / 2U);
+    }
+
+    TFT_Text(
+        x,
+        y,
+        text,
+        scale,
+        color,
+        bg
+    );
+}
+
+static void TFT_ShowSplash(void)
+{
+    TFT_FillRect(
+        0U,
+        0U,
+        TFT_WIDTH,
+        TFT_HEIGHT,
+        TFT_BG
+    );
+
+    TFT_FillRect(
+        0U, 0U,
+        TFT_WIDTH, 7U,
+        TFT_RED
+    );
+
+    TFT_FillRect(
+        0U, 7U,
+        TFT_WIDTH, 2U,
+        TFT_ORANGE
+    );
+
+    TFT_CenteredText(
+        84U,
+        "HELIOTECH",
+        6U,
+        TFT_WHITE,
+        TFT_BG
+    );
+
+    TFT_CenteredText(
+        167U,
+        "electrical system design by",
+        2U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    TFT_CenteredText(
+        197U,
+        "Stanley Qiu",
+        3U,
+        TFT_CYAN,
+        TFT_BG
+    );
+
+    TFT_FillRect(
+        112U,
+        266U,
+        256U,
+        2U,
+        TFT_PANEL
+    );
+
+    TFT_CenteredText(
+        279U,
+        "WHEEL CONTROL SYSTEM V3",
+        1U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    tft_splash_shown = 1U;
+}
+
+/* =====================================================
+ * F1 SPEED BAR
+ * ===================================================== */
+
+static void TFT_DrawSpeedBar(uint8_t count)
+{
+    static uint8_t previous = 255U;
+
+    if (count == previous)
+    {
+        return;
+    }
+
+    if (count > SPEED_BAR_SEGMENTS)
+    {
+        count = SPEED_BAR_SEGMENTS;
+    }
+
+    for (uint8_t i = 0U; i < SPEED_BAR_SEGMENTS; i++)
+    {
+        uint16_t color =
+            (i < 7U) ? 0x4000U :
+            (i < 13U) ? 0x4200U : 0x0240U;
+
+        if (i < count)
+        {
+            if (i < 7U)
+            {
+                color = TFT_RED;
+            }
+            else if (i < 13U)
+            {
+                color = TFT_AMBER;
+            }
+            else
+            {
+                color = TFT_GREEN;
+            }
+        }
+
+        TFT_FillRect(
+            (uint16_t)(10U + 23U * i),
+            8U,
+            20U,
+            17U,
+            color
+        );
+    }
+
+    previous = count;
+}
+
+/* =====================================================
+ * LARGE TURN / HAZARD ICONS
+ * ===================================================== */
+
+static uint8_t tftSymbolPixels[32U * 24U * 2U];
+
+static void TFT_DrawSymbol(
+    uint16_t x,
+    uint16_t y,
+    uint8_t kind,
+    uint16_t color,
+    uint16_t bg
+)
+{
+    uint16_t p = 0U;
+
+    for (uint8_t row = 0U; row < 24U; row++)
+    {
+        for (uint8_t col = 0U; col < 32U; col++)
+        {
+            uint8_t on = 0U;
+
+            if (kind < 2U)
+            {
+                uint8_t c =
+                    (kind == 0U) ?
+                    col :
+                    (uint8_t)(31U - col);
+
+                uint8_t dy =
+                    (row > 12U) ?
+                    (uint8_t)(row - 12U) :
+                    (uint8_t)(12U - row);
+
+                if (
+                    (c >= 11U &&
+                     row >= 9U &&
+                     row <= 15U) ||
+                    (c < 16U &&
+                     dy <= (uint8_t)(c / 2U + 1U))
+                )
+                {
+                    on = 1U;
+                }
+            }
+            else
+            {
+                if (row >= 2U && row <= 22U)
+                {
+                    uint8_t half =
+                        (uint8_t)((row - 1U) * 2U / 3U);
+
+                    uint8_t delta =
+                        (col > 15U) ?
+                        (uint8_t)(col - 15U) :
+                        (uint8_t)(15U - col);
+
+                    if (delta <= half)
+                    {
+                        on = 1U;
+                    }
+                }
+            }
+
+            uint16_t pixel = on ? color : bg;
+
+            if (
+                kind == 2U &&
+                on &&
+                (
+                    (col >= 14U &&
+                     col <= 16U &&
+                     row >= 10U &&
+                     row <= 16U) ||
+                    (col >= 14U &&
+                     col <= 16U &&
+                     row >= 19U &&
+                     row <= 20U)
+                )
+            )
+            {
+                pixel = bg;
+            }
+
+            tftSymbolPixels[p++] = (uint8_t)(pixel >> 8);
+            tftSymbolPixels[p++] = (uint8_t)pixel;
+        }
+    }
+
+    TFT_BeginWindow(
+        x,
+        y,
+        (uint16_t)(x + 31U),
+        (uint16_t)(y + 23U)
+    );
+
+    TFT_SPIWrite(tftSymbolPixels, p);
+    TFT_Deselect();
+}
+
+/* =====================================================
+ * SMALL SYSTEM ICONS
+ * ===================================================== */
+
+static uint8_t tftMiniIconPixels[14U * 14U * 2U];
+
+static void TFT_DrawMiniIcon(
+    uint16_t x,
+    uint16_t y,
+    uint8_t kind,
+    uint16_t color
+)
+{
+    uint16_t k = 0U;
+
+    for (uint8_t row = 0U; row < 14U; row++)
+    {
+        for (uint8_t col = 0U; col < 14U; col++)
+        {
+            uint8_t on = 0U;
+
+            uint8_t delta =
+                (row > 7U) ?
+                (uint8_t)(row - 7U) :
+                (uint8_t)(7U - row);
+
+            if (kind == 0U || kind == 6U)
+            {
+                if (
+                    (col >= 5U &&
+                     row >= 6U &&
+                     row <= 8U) ||
+                    (col <= 8U &&
+                     delta <= (uint8_t)(col / 2U + 1U))
+                )
+                {
+                    on = 1U;
+                }
+            }
+            else if (kind == 1U || kind == 7U)
+            {
+                uint8_t c = (uint8_t)(13U - col);
+
+                if (
+                    (c >= 5U &&
+                     row >= 6U &&
+                     row <= 8U) ||
+                    (c <= 8U &&
+                     delta <= (uint8_t)(c / 2U + 1U))
+                )
+                {
+                    on = 1U;
+                }
+            }
+            else if (kind == 2U)
+            {
+                uint8_t half = (uint8_t)(row / 2U);
+
+                uint8_t dx =
+                    col > 7U ?
+                    (uint8_t)(col - 7U) :
+                    (uint8_t)(7U - col);
+
+                if (
+                    row >= 1U &&
+                    row <= 12U &&
+                    dx <= half
+                )
+                {
+                    on =
+                        (
+                            dx == half ||
+                            row == 12U ||
+                            (
+                                col == 7U &&
+                                (row <= 8U || row == 11U)
+                            )
+                        );
+                }
+            }
+            else if (kind == 3U)
+            {
+                if (
+                    (col >= 1U &&
+                     col <= 4U &&
+                     row >= 5U &&
+                     row <= 9U) ||
+                    (col >= 5U &&
+                     col <= 8U &&
+                     row >= 9U - col / 3U &&
+                     row <= 5U + col / 3U) ||
+                    (col == 10U &&
+                     (row == 3U ||
+                      row == 11U ||
+                      row == 7U)) ||
+                    (col == 12U &&
+                     (row == 2U ||
+                      row == 12U ||
+                      row == 7U))
+                )
+                {
+                    on = 1U;
+                }
+            }
+            else if (kind == 4U)
+            {
+                if (
+                    (col >= 1U &&
+                     col <= 5U &&
+                     row >= 4U &&
+                     row <= 10U) ||
+                    (col == 7U &&
+                     (row == 4U ||
+                      row == 7U ||
+                      row == 10U)) ||
+                    (col >= 9U &&
+                     col <= 12U &&
+                     (row == 3U ||
+                      row == 7U ||
+                      row == 11U))
+                )
+                {
+                    on = 1U;
+                }
+            }
+            else if (kind == 5U)
+            {
+                if (
+                    (col >= 2U &&
+                     col <= 12U &&
+                     (row == 5U || row == 12U)) ||
+                    ((col == 2U || col == 12U) &&
+                     row >= 5U &&
+                     row <= 12U) ||
+                    (col >= 4U &&
+                     col <= 10U &&
+                     row == 8U) ||
+                    (col == 9U &&
+                     row >= 9U &&
+                     row <= 10U) ||
+                    (col >= 4U &&
+                     col <= 9U &&
+                     row == (uint8_t)(9U - col))
+                )
+                {
+                    on = 1U;
+                }
+            }
+            else if (kind == 8U)
+            {
+                if (
+                    (col >= 6U &&
+                     col <= 8U &&
+                     row >= 2U &&
+                     row <= 12U) ||
+                    (row >= 6U &&
+                     row <= 8U &&
+                     col >= 2U &&
+                     col <= 12U)
+                )
+                {
+                    on = 1U;
+                }
+            }
+            else if (kind == 9U)
+            {
+                uint8_t dx =
+                    col > 7U ?
+                    (uint8_t)(col - 7U) :
+                    (uint8_t)(7U - col);
+
+                if (
+                    (dx <= 1U && delta <= 1U) ||
+                    (row >= 2U &&
+                     row <= 5U &&
+                     col >= 6U &&
+                     col <= 8U) ||
+                    (row >= 9U &&
+                     row <= 12U &&
+                     col >= 6U &&
+                     col <= 8U) ||
+                    (col >= 2U &&
+                     col <= 5U &&
+                     row >= 6U &&
+                     row <= 8U) ||
+                    (col >= 9U &&
+                     col <= 12U &&
+                     row >= 6U &&
+                     row <= 8U)
+                )
+                {
+                    on = 1U;
+                }
+            }
+
+            uint16_t pixel = on ? color : TFT_PANEL;
+
+            tftMiniIconPixels[k++] = (uint8_t)(pixel >> 8);
+            tftMiniIconPixels[k++] = (uint8_t)pixel;
+        }
+    }
+
+    TFT_BeginWindow(
+        x,
+        y,
+        (uint16_t)(x + 13U),
+        (uint16_t)(y + 13U)
+    );
+
+    TFT_SPIWrite(tftMiniIconPixels, k);
+    TFT_Deselect();
+}
+
+/* Visible icon slots only; electrical switch IDs and RS485 bits are unchanged.
+ * Buttons: LEFT=0, RIGHT=1, HAZARD=2, HORN=3, LIGHT=4, ...
+ * Slots:   LEFT=0, LIGHT=1, HAZARD=2, HORN=3, RIGHT=4, ...
+ */
+static const uint8_t tftIconSlotForButton[SWITCH_COUNT] =
+{
+    0U, 4U, 2U, 3U, 1U, 5U, 6U, 7U, 8U, 9U
+};
+
+static const char *const tftSwitchLabels[SWITCH_COUNT] =
+{
+    "LEFT",
+    "RIGHT",
+    "HAZARD",
+    "HORN",
+    "LIGHT",
+    "RADIO",
+    "BACK",
+    "NEXT",
+    "PH1",
+    "FAN"
+};
+
+/* =====================================================
+ * STATIC DASHBOARD
+ * ===================================================== */
+
+static void TFT_DrawStatic(void)
+{
+    TFT_FillRect(
+        0U, 0U,
+        TFT_WIDTH,
+        TFT_HEIGHT,
+        TFT_BG
+    );
+
+    TFT_FillRect(
+        0U, 0U,
+        TFT_WIDTH, 31U,
+        TFT_BLACK
+    );
+
+    TFT_FillRect(
+        0U, 31U,
+        TFT_WIDTH, 34U,
+        TFT_PANEL
+    );
+
+    TFT_Text(
+        13U, 37U,
+        "HELIOTECH",
+        3U,
+        TFT_CYAN,
+        TFT_PANEL
+    );
+
+    TFT_Text(
+        219U, 40U,
+        "GILBERT V3.0",
+        2U,
+        TFT_WHITE,
+        TFT_PANEL
+    );
+
+    TFT_FillRect(
+        0U, 65U,
+        TFT_WIDTH, 2U,
+        TFT_CYAN
+    );
+
+    TFT_Text(
+        17U, 84U,
+        "SPEED",
+        2U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    TFT_Text(
+        407U, 138U,
+        "MPH",
+        2U,
+        TFT_CYAN,
+        TFT_BG
+    );
+
+    TFT_FillRect(
+        0U, 177U,
+        TFT_WIDTH, 2U,
+        TFT_PANEL
+    );
+
+    TFT_Text(
+        59U, 194U,
+        "LEFT",
+        2U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    TFT_Text(
+        253U, 199U,
+        "HAZARD",
+        1U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    TFT_Text(
+        366U, 194U,
+        "RIGHT",
+        2U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    TFT_FillRect(
+        0U, 224U,
+        TFT_WIDTH, 1U,
+        TFT_PANEL
+    );
+
+    for (uint8_t i = 0U; i < SWITCH_COUNT; i++)
+    {
+        uint8_t slot = tftIconSlotForButton[i];
+
+        uint16_t x =
+            (uint16_t)(7U + 95U * (slot % 5U));
+
+        uint16_t y =
+            (slot < 5U) ? 230U : 255U;
+
+        TFT_FillRect(
+            x, y,
+            87U, 22U,
+            TFT_PANEL
+        );
+
+        TFT_FillRect(
+            (uint16_t)(x + 3U),
+            (uint16_t)(y + 4U),
+            14U,
+            14U,
+            TFT_DARK_LED
+        );
+
+        TFT_Text(
+            (uint16_t)(x + 21U),
+            (uint16_t)(y + 7U),
+            tftSwitchLabels[i],
+            1U,
+            TFT_WHITE,
+            TFT_PANEL
+        );
+    }
+
+    TFT_FillRect(
+        0U, 284U,
+        TFT_WIDTH, 1U,
+        TFT_CYAN
+    );
+
+    TFT_Text(
+        9U, 289U,
+        "IMU",
+        1U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    TFT_Text(
+        9U, 301U,
+        "R/P/Y (DEG)",
+        1U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    TFT_Text(
+        350U, 289U,
+        "RS485 RX",
+        1U,
+        TFT_GRAY,
+        TFT_BG
+    );
+
+    tft_dashboard_ready = 1U;
+}
+
+/* =====================================================
+ * DYNAMIC DASHBOARD
+ * ===================================================== */
+
+static void TFT_Refresh(void)
+{
+    static char oldSpeed[8] = {0};
+    static char oldSpeedLink[16] = {0};
+    static char oldSource[16] = {0};
+    static char oldAngles[64] = {0};
+    static char oldImu[16] = {0};
+    static char oldRxCount[20] = {0};
+
+    static uint8_t oldLeft = 255U;
+    static uint8_t oldRight = 255U;
+    static uint8_t oldHazard = 255U;
+
+    static uint8_t oldChip[SWITCH_COUNT] =
+    {
+        255U,255U,255U,255U,255U,
+        255U,255U,255U,255U,255U
+    };
+
+    char speedText[8];
+    char buffer[64];
+    char roll[18];
+    char pitch[18];
+    char yaw[18];
+
+    uint32_t now = HAL_GetTick();
+
+    if (!tft_dashboard_ready)
+    {
+        return;
+    }
+
+    speed_valid =
+        (
+            speed_rx_packets > 0U &&
+            (uint32_t)(now - speed_last_rx_ms)
+                < SPEED_TIMEOUT_MS
+        ) ? 1U : 0U;
+
+    if (
+        speed_valid &&
+        speed_tenths <= SPEED_MAX_MPH * 10U
+    )
+    {
+        uint32_t integer = speed_tenths / 10U;
+
+        speedText[0] =
+            integer >= 100U ?
+            (char)('0' + integer / 100U) : ' ';
+
+        speedText[1] =
+            integer >= 10U ?
+            (char)('0' + (integer / 10U) % 10U) : ' ';
+
+        speedText[2] =
+            (char)('0' + integer % 10U);
+
+        speedText[3] = '.';
+
+        speedText[4] =
+            (char)('0' + speed_tenths % 10U);
+
+        speedText[5] = '\0';
+    }
+    else
+    {
+        memcpy(speedText, " N/A ", 6U);
+    }
+
+    TFT_TextChanged(
+        90U,
+        89U,
+        speedText,
+        oldSpeed,
+        sizeof(oldSpeed),
+        10U,
+        TFT_WHITE,
+        TFT_BG
+    );
+
+    TFT_TextChanged(
+        412U,
+        46U,
+        speed_valid ? "SPD LIVE" : "NO SPEED",
+        oldSpeedLink,
+        sizeof(oldSpeedLink),
+        1U,
+        TFT_CYAN,
+        TFT_PANEL
+    );
+
+    uint8_t ledCount = 0U;
+
+    if (speed_valid)
+    {
+        uint32_t n =
+            (speed_tenths * SPEED_BAR_SEGMENTS) /
+            (SPEED_BAR_FULL_MPH * 10U);
+
+        if (n > SPEED_BAR_SEGMENTS)
+        {
+            n = SPEED_BAR_SEGMENTS;
+        }
+
+        ledCount = (uint8_t)n;
+    }
+
+    TFT_DrawSpeedBar(ledCount);
+
+    /* Main controller status or local fallback */
+
+    display_system_remote =
+        (
+            remote_system_packets > 0U &&
+            (uint32_t)(now - remote_system_last_ms)
+                < SYSTEM_TIMEOUT_MS
+        ) ? 1U : 0U;
+
+    if (display_system_remote)
+    {
+        display_system_mask =
+            remote_system_mask & 0x3FFU;
+    }
+    else
+    {
+        display_system_mask =
+            local_latched_mask |
+            (
+                sw_pressed_mask &
+                (
+                    (1UL << 3U) |  /* Horn */
+                    (1UL << 5U) |  /* Radio PTT */
+                    (1UL << 6U) |  /* Back */
+                    (1UL << 7U)    /* Next */
+                )
+            );
+    }
+
+    /*
+     * IMPORTANT:
+     * RADIO/PTT is NEVER latched.
+     *
+     * Display the physical button state,
+     * even when remote SYS status is present.
+     */
+
+    display_system_mask =
+        (display_system_mask & ~(1UL << 5U)) |
+        (sw_pressed_mask & (1UL << 5U));
+
+    TFT_TextChanged(
+        412U,
+        57U,
+        display_system_remote ? "SYS LIVE" : "SW CMD  ",
+        oldSource,
+        sizeof(oldSource),
+        1U,
+        TFT_GRAY,
+        TFT_PANEL
+    );
+
+    /* Turn signal blinking */
+
+    uint8_t flash =
+        ((now / TURN_BLINK_HALF_MS) & 1U) == 0U ?
+        1U : 0U;
+
+    tft_flash_phase = flash;
+
+    uint32_t mask = display_system_mask;
+
+    uint8_t hazard =
+        ((mask & (1UL << 2U)) != 0U) ? 1U : 0U;
+
+    uint8_t leftOn =
+        (
+            hazard ||
+            ((mask & 1UL) != 0U)
+        ) && flash;
+
+    uint8_t rightOn =
+        (
+            hazard ||
+            ((mask & (1UL << 1U)) != 0U)
+        ) && flash;
+
+    uint8_t hazardOn = hazard && flash;
+
+    if (oldLeft != leftOn)
+    {
+        TFT_DrawSymbol(
+            18U, 187U,
+            0U,
+            leftOn ? TFT_GREEN : TFT_DARK_LED,
+            TFT_BG
+        );
+
+        oldLeft = leftOn;
+    }
+
+    if (oldRight != rightOn)
+    {
+        TFT_DrawSymbol(
+            437U, 187U,
+            1U,
+            rightOn ? TFT_GREEN : TFT_DARK_LED,
+            TFT_BG
+        );
+
+        oldRight = rightOn;
+    }
+
+    if (oldHazard != hazardOn)
+    {
+        TFT_DrawSymbol(
+            215U, 187U,
+            2U,
+            hazardOn ? TFT_RED : TFT_DARK_LED,
+            TFT_BG
+        );
+
+        oldHazard = hazardOn;
+    }
+
+    for (uint8_t i = 0U; i < SWITCH_COUNT; i++)
+    {
+        uint8_t on =
+            ((mask & (1UL << i)) != 0U) ?
+            1U : 0U;
+
+        if (i == 0U || i == 1U)
+        {
+            on = on && flash;
+        }
+
+        if (i == 2U)
+        {
+            on = on && flash;
+        }
+
+        if ((i == 0U || i == 1U) && hazard)
+        {
+            on = flash;
+        }
+
+        if (on != oldChip[i])
+        {
+            uint8_t slot = tftIconSlotForButton[i];
+
+            uint16_t x =
+                (uint16_t)(
+                    7U + 95U * (slot % 5U) + 4U
+                );
+
+            uint16_t y =
+                (slot < 5U) ? 235U : 260U;
+
+            uint16_t color = TFT_DARK_LED;
+
+            if (on)
+            {
+                color =
+                    (i == 2U) ? TFT_RED :
+                    (i == 3U) ? TFT_AMBER :
+                    TFT_GREEN;
+            }
+
+            TFT_DrawMiniIcon(x, y, i, color);
+            oldChip[i] = on;
+        }
+    }
+
+    if (imu_orientation_valid)
+    {
+        TFT_FormatAngle(
+            roll,
+            sizeof(roll),
+            imu_roll_deg
+        );
+
+        TFT_FormatAngle(
+            pitch,
+            sizeof(pitch),
+            imu_pitch_deg
+        );
+
+        TFT_FormatAngle(
+            yaw,
+            sizeof(yaw),
+            imu_yaw_deg
+        );
+
+        (void)snprintf(
+            buffer,
+            sizeof(buffer),
+            "R:%s P:%s Y:%s",
+            roll,
+            pitch,
+            yaw
+        );
+    }
+    else
+    {
+        (void)snprintf(
+            buffer,
+            sizeof(buffer),
+            "R:N/A P:N/A Y:N/A"
+        );
+    }
+
+    TFT_TextChanged(
+        110U,
+        301U,
+        buffer,
+        oldAngles,
+        sizeof(oldAngles),
+        1U,
+        TFT_WHITE,
+        TFT_BG
+    );
+
+    TFT_TextChanged(
+        45U,
+        289U,
+        imu_ok ?
+            (imu_orientation_valid ? "OK " : "CAL") :
+            "ERR",
+        oldImu,
+        sizeof(oldImu),
+        1U,
+        TFT_GREEN,
+        TFT_BG
+    );
+
+    (void)snprintf(
+        buffer,
+        sizeof(buffer),
+        "%lu",
+        (unsigned long)rs485_rx_count
+    );
+
+    TFT_TextChanged(
+        414U,
+        289U,
+        buffer,
+        oldRxCount,
+        sizeof(oldRxCount),
+        1U,
+        TFT_CYAN,
+        TFT_BG
+    );
+
+    tft_refresh_count++;
+}
+
+/* =====================================================
+ * USART2 INTERRUPT
+ * ===================================================== */
+
+void USART2_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart2);
+}
+
+void HAL_UART_RxCpltCallback(
+    UART_HandleTypeDef *uart
+)
+{
+    if (uart->Instance != USART2)
+    {
+        return;
+    }
+
+    uint8_t c = rs485_rx_irq_byte;
+
+    rs485_rx_bytes++;
+
+    if (c == '\r')
+    {
+        /* Ignore CR */
+    }
+    else if (c == '\n')
+    {
+        if (
+            !rs485_rx_discard_line &&
+            rs485_rx_build_length > 0U
+        )
+        {
+            uint8_t next =
+                (uint8_t)(
+                    (rs485_rx_queue_head + 1U) %
+                    RS485_RX_QUEUE_SIZE
+                );
+
+            if (next != rs485_rx_queue_tail)
+            {
+                uint8_t head = rs485_rx_queue_head;
+
+                for (
+                    uint8_t i = 0U;
+                    i < rs485_rx_build_length;
+                    i++
+                )
+                {
+                    rs485_rx_queue[head][i] =
+                        rs485_rx_build[i];
+                }
+
+                rs485_rx_queue[head]
+                    [rs485_rx_build_length] = '\0';
+
+                rs485_rx_queue_head = next;
+            }
+            else
+            {
+                rs485_rx_dropped++;
+            }
+        }
+
+        rs485_rx_build_length = 0U;
+        rs485_rx_discard_line = 0U;
+    }
+    else if (!rs485_rx_discard_line)
+    {
+        if (
+            rs485_rx_build_length <
+            RS485_RX_LINE_SIZE - 1U
+        )
+        {
+            rs485_rx_build[rs485_rx_build_length++] =
+                (char)c;
+        }
+        else
+        {
+            rs485_rx_line_overflows++;
+            rs485_rx_discard_line = 1U;
+        }
+    }
+
+    if (
+        HAL_UART_Receive_IT(
+            &huart2,
+            &rs485_rx_irq_byte,
+            1U
+        ) != HAL_OK
+    )
+    {
+        rs485_rx_errors++;
+    }
+}
+
+void HAL_UART_ErrorCallback(
+    UART_HandleTypeDef *uart
+)
+{
+    if (uart->Instance != USART2)
+    {
+        return;
+    }
+
+    rs485_rx_errors++;
+
+    rs485_rx_build_length = 0U;
+    rs485_rx_discard_line = 0U;
+
+    (void)HAL_UART_Receive_IT(
+        &huart2,
+        &rs485_rx_irq_byte,
+        1U
+    );
+}
+
+/* =====================================================
+ * SPEED PARSER
+ * ===================================================== */
+
+static uint8_t ParseSpeedTenths(
+    const char *value,
+    uint32_t *tenths
+)
+{
+    uint32_t whole = 0U;
+    uint32_t decimal = 0U;
+    uint8_t digits = 0U;
+
+    if (value == NULL || tenths == NULL)
+    {
+        return 0U;
+    }
+
+    while (*value == ' ')
+    {
+        value++;
+    }
+
+    if (*value == '+')
+    {
+        value++;
+    }
+
+    while (*value >= '0' && *value <= '9')
+    {
+        digits = 1U;
+
+        whole =
+            whole * 10U +
+            (uint32_t)(*value - '0');
+
+        if (whole > SPEED_MAX_MPH)
+        {
+            return 0U;
+        }
+
+        value++;
+    }
+
+    if (!digits)
+    {
+        return 0U;
+    }
+
+    if (*value == '.')
+    {
+        value++;
+
+        if (*value < '0' || *value > '9')
+        {
+            return 0U;
+        }
+
+        decimal = (uint32_t)(*value - '0');
+
+        value++;
+
+        while (*value >= '0' && *value <= '9')
+        {
+            value++;
+        }
+    }
+
+    while (*value == ' ')
+    {
+        value++;
+    }
+
+    if (*value != '\0')
+    {
+        return 0U;
+    }
+
+    if (
+        whole == SPEED_MAX_MPH &&
+        decimal != 0U
+    )
+    {
+        return 0U;
+    }
+
+    *tenths = whole * 10U + decimal;
+
+    return 1U;
+}
+
+/* =====================================================
+ * SYSTEM BITMASK PARSER
+ * ===================================================== */
+
+static uint8_t ParseHexMask(
+    const char *value,
+    uint32_t *mask
+)
+{
+    uint32_t result = 0U;
+    uint8_t digits = 0U;
+
+    if (value == NULL || mask == NULL)
+    {
+        return 0U;
+    }
+
+    while (*value == ' ')
+    {
+        value++;
+    }
+
+    if (
+        value[0] == '0' &&
+        (value[1] == 'x' || value[1] == 'X')
+    )
+    {
+        value += 2;
+    }
+
+    while (*value != '\0' && *value != ' ')
+    {
+        uint8_t d;
+
+        if (*value >= '0' && *value <= '9')
+        {
+            d = (uint8_t)(*value - '0');
+        }
+        else if (*value >= 'A' && *value <= 'F')
+        {
+            d = (uint8_t)(*value - 'A' + 10);
+        }
+        else if (*value >= 'a' && *value <= 'f')
+        {
+            d = (uint8_t)(*value - 'a' + 10);
+        }
+        else
+        {
+            return 0U;
+        }
+
+        result = result * 16U + d;
+
+        if (result > 0x3FFU)
+        {
+            return 0U;
+        }
+
+        digits++;
+        value++;
+    }
+
+    while (*value == ' ')
+    {
+        value++;
+    }
+
+    if (!digits || *value != '\0')
+    {
+        return 0U;
+    }
+
+    *mask = result;
+
+    return 1U;
+}
+
+/* =====================================================
+ * PROCESS RECEIVED RS485 MESSAGES
+ * ===================================================== */
+
+static void RS485_ProcessReceived(void)
+{
+    char line[RS485_RX_LINE_SIZE];
+
+    uint8_t tail = rs485_rx_queue_tail;
+
+    if (tail == rs485_rx_queue_head)
+    {
+        return;
+    }
+
+    uint8_t i = 0U;
+
+    for (
+        ;
+        i < RS485_RX_LINE_SIZE - 1U;
+        i++
+    )
+    {
+        line[i] = rs485_rx_queue[tail][i];
+
+        if (line[i] == '\0')
+        {
+            break;
+        }
+    }
+
+    line[RS485_RX_LINE_SIZE - 1U] = '\0';
+
+    rs485_rx_queue_tail =
+        (uint8_t)(
+            (tail + 1U) %
+            RS485_RX_QUEUE_SIZE
+        );
+
+    rs485_rx_count++;
+
+    for (i = 0U; i < RS485_RX_LINE_SIZE; i++)
+    {
+        rs485_last_rx_message[i] = line[i];
+
+        if (line[i] == '\0')
+        {
+            break;
+        }
+    }
+
+    const char *speedField = NULL;
+    const char *sysField = NULL;
+
+    if (strncmp(line, "S,", 2U) == 0)
+    {
+        speedField = line + 2U;
+    }
+    else if (strncmp(line, "SPD,", 4U) == 0)
+    {
+        speedField = line + 4U;
+    }
+    else if (strncmp(line, "SPEED,", 6U) == 0)
+    {
+        speedField = line + 6U;
+    }
+    else if (strncmp(line, "SYS,", 4U) == 0)
+    {
+        sysField = line + 4U;
+    }
+    else if (strncmp(line, "STATE,", 6U) == 0)
+    {
+        sysField = line + 6U;
+    }
+
+    if (speedField != NULL)
+    {
+        uint32_t tenths;
+
+        if (ParseSpeedTenths(speedField, &tenths))
+        {
+            speed_tenths = tenths;
+            speed_mph = (float)tenths * 0.1f;
+            speed_last_rx_ms = HAL_GetTick();
+
+            speed_rx_packets++;
+            speed_valid = 1U;
+        }
+        else
+        {
+            speed_parse_errors++;
+        }
+    }
+    else if (sysField != NULL)
+    {
+        uint32_t mask;
+
+        if (ParseHexMask(sysField, &mask))
+        {
+            remote_system_mask = mask;
+            remote_system_last_ms = HAL_GetTick();
+            remote_system_packets++;
+        }
+    }
+    else if (strcmp(line, "ZEROYAW") == 0)
+    {
+        imu_yaw_deg = 0.0f;
+        rs485_zero_yaw_commands++;
+    }
+    else if (strcmp(line, "PING") == 0)
+    {
+        rs485_ping_commands++;
+
+        (void)RS485_Send(
+            "PONG\r\n",
+            0U
+        );
+    }
+}
+
+/* =====================================================
+ * RS485 TRANSMISSION
+ * ===================================================== */
+
+static uint8_t RS485_Send(
+    const char *message,
+    uint32_t message_type
+)
+{
+    uint16_t length = 0U;
+    HAL_StatusTypeDef status;
+
+    if (message == NULL)
+    {
+        return 0U;
+    }
+
+    while (
+        message[length] != '\0' &&
+        length < 95U
+    )
+    {
+        rs485_last_message[length] = message[length];
+        length++;
+    }
+
+    rs485_last_message[length] = '\0';
+
+    if (
+        length == 0U ||
+        message[length] != '\0'
+    )
+    {
+        rs485_tx_errors++;
+        return 0U;
+    }
+
+    rs485_last_message_type = message_type;
+
+    /* Enable MAX3485 transmitter */
+
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_1,
+        GPIO_PIN_SET
+    );
+
+    rs485_de_state = 1U;
+
+    HAL_Delay(1U);
+
+    status = HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)message,
+        length,
+        100U
+    );
+
+    /* Return MAX3485 to receive mode */
+
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_1,
+        GPIO_PIN_RESET
+    );
+
+    rs485_de_state = 0U;
+
+    rs485_last_hal_status = (uint32_t)status;
+
+    if (status != HAL_OK)
+    {
+        rs485_tx_errors++;
+        return 0U;
+    }
+
+    rs485_tx_count++;
+
+    if (message_type == 1U)
+    {
+        rs485_button_packets++;
+    }
+    else if (message_type == 2U)
+    {
+        rs485_orientation_packets++;
+    }
+
+    return 1U;
+}
+
+/* =====================================================
+ * BUTTON EVENT TRANSMISSION
+ * ===================================================== */
+
+static void RS485_SendButton(
+    uint8_t index,
+    uint8_t pressed
+)
+{
+    char message[96];
+
+    int n = snprintf(
+        message,
+        sizeof(message),
+        "B,%lu,%u,%s,%u,%03lX\r\n",
+        (unsigned long)HAL_GetTick(),
+        (unsigned int)(index + 1U),
+        buttons[index].name,
+        (unsigned int)pressed,
+        (unsigned long)sw_pressed_mask
+    );
+
+    if (
+        n > 0 &&
+        (size_t)n < sizeof(message)
+    )
+    {
+        rs485_last_button_id =
+            (uint32_t)index + 1U;
+
+        rs485_last_button_state = pressed;
+
+        for (size_t i = 0U; i <= (size_t)n; i++)
+        {
+            rs485_last_button_message[i] =
+                message[i];
+        }
+
+        (void)RS485_Send(message, 1U);
+    }
+    else
+    {
+        rs485_tx_errors++;
+    }
+}
+
+/* =====================================================
+ * ORIENTATION TRANSMISSION
+ * ===================================================== */
+
+static void RS485_SendOrientation(void)
+{
+    char message[96];
+
+    long roll_cd =
+        (long)(imu_roll_deg * 100.0f);
+
+    long pitch_cd =
+        (long)(imu_pitch_deg * 100.0f);
+
+    long yaw_cd =
+        (long)(imu_yaw_deg * 100.0f);
+
+    int n = snprintf(
+        message,
+        sizeof(message),
+        "O,%lu,%lu,%ld,%ld,%ld,%03lX\r\n",
+        (unsigned long)HAL_GetTick(),
+        (unsigned long)(
+            imu_ok && imu_orientation_valid
+        ),
+        roll_cd,
+        pitch_cd,
+        yaw_cd,
+        (unsigned long)sw_pressed_mask
+    );
+
+    if (
+        n > 0 &&
+        (size_t)n < sizeof(message)
+    )
+    {
+        (void)RS485_Send(message, 2U);
+    }
+    else
+    {
+        rs485_tx_errors++;
+    }
+}
+
+/* =====================================================
+ * TURN-SIGNAL AUTO-CANCEL
+ * ===================================================== */
+
+static void TurnCancel_Stop(void)
+{
+    turn_cancel_side = 0U;
+    turn_cancel_armed = 0U;
+
+    turn_cancel_yaw_delta_deg = 0.0f;
+    turn_cancel_peak_deg = 0.0f;
+
+    turn_waiting_for_imu = 0U;
+}
+
+static void TurnCancel_Start(uint8_t side)
+{
+    TurnCancel_Stop();
+
+    if (side != 1U && side != 2U)
+    {
+        return;
+    }
+
+    turn_cancel_side = side;
+
+    turn_start_ms = HAL_GetTick();
+    turn_start_yaw_deg = imu_yaw_total_deg;
+
+    if (!imu_ok || !imu_orientation_valid)
+    {
+        turn_waiting_for_imu = 1U;
+    }
+}
+
+static uint8_t TurnCancel_SendVirtualButton(
+    uint8_t index,
+    uint8_t pressed
+)
+{
+    char message[96];
+
+    uint32_t fake_mask = sw_pressed_mask;
+
+    if (pressed)
+    {
+        fake_mask |= (1UL << index);
+    }
+    else
+    {
+        fake_mask &= ~(1UL << index);
+    }
+
+    int n = snprintf(
+        message,
+        sizeof(message),
+        "B,%lu,%u,%s,%u,%03lX\r\n",
+        (unsigned long)HAL_GetTick(),
+        (unsigned int)(index + 1U),
+        buttons[index].name,
+        (unsigned int)pressed,
+        (unsigned long)fake_mask
+    );
+
+    if (
+        n <= 0 ||
+        (size_t)n >= sizeof(message)
+    )
+    {
+        turn_cancel_tx_errors++;
+        return 0U;
+    }
+
+    rs485_last_button_id = (uint32_t)index + 1U;
+    rs485_last_button_state = pressed;
+
+    for (size_t i = 0U; i <= (size_t)n; i++)
+    {
+        rs485_last_button_message[i] = message[i];
+    }
+
+    if (!RS485_Send(message, 1U))
+    {
+        turn_cancel_tx_errors++;
+        return 0U;
+    }
+
+    return 1U;
+}
+
+static void TurnCancel_Update(void)
+{
+    uint8_t side = (uint8_t)turn_cancel_side;
+
+    if (side == 0U)
+    {
+        return;
+    }
+
+    if (!imu_ok || !imu_orientation_valid)
+    {
+        turn_waiting_for_imu = 1U;
+        turn_cancel_armed = 0U;
+        return;
+    }
+
+    if (turn_waiting_for_imu)
+    {
+        turn_start_ms = HAL_GetTick();
+        turn_start_yaw_deg = imu_yaw_total_deg;
+
+        turn_waiting_for_imu = 0U;
+        turn_cancel_armed = 0U;
+        turn_cancel_peak_deg = 0.0f;
+
+        return;
+    }
+
+    float delta =
+        imu_yaw_total_deg - turn_start_yaw_deg;
+
+    float in_turn_direction =
+        (side == 2U) ? delta : -delta;
+
+    turn_cancel_yaw_delta_deg = delta;
+
+    if (in_turn_direction > turn_cancel_peak_deg)
+    {
+        turn_cancel_peak_deg = in_turn_direction;
+    }
+
+    /* Arm after steering far enough */
+
+    if (!turn_cancel_armed)
+    {
+        if (in_turn_direction >= TURN_ARM_DEG)
+        {
+            turn_cancel_armed = 1U;
+        }
+
+        return;
+    }
+
+    /* Cancel only after returning near center */
+
+    if (fabsf(delta) > TURN_RETURN_DEG)
+    {
+        return;
+    }
+
+    if (
+        (uint32_t)(HAL_GetTick() - turn_start_ms) <
+        TURN_MIN_ACTIVE_MS
+    )
+    {
+        return;
+    }
+
+    uint8_t index = (uint8_t)(side - 1U);
+
+    if (sw_stable[index])
+    {
+        return;
+    }
+
+    local_latched_mask &= ~(1UL << index);
+
+    turn_cancel_count++;
+    turn_cancel_last_side = side;
+
+    TurnCancel_Stop();
+
+    /* Synthetic press and release */
+
+    if (TurnCancel_SendVirtualButton(index, 1U))
+    {
+        (void)TurnCancel_SendVirtualButton(index, 0U);
+    }
+}
+
+/* =====================================================
+ * SWITCH INPUT
+ * ===================================================== */
+
+static uint8_t Switch_Read(uint8_t index)
+{
+    return (
+        HAL_GPIO_ReadPin(
+            buttons[index].port,
+            buttons[index].pin
+        ) == GPIO_PIN_RESET
+    ) ? 1U : 0U;
+}
+
+static void Switch_Publish(void)
+{
+    sw_left = sw_stable[0];
+    sw_right = sw_stable[1];
+    sw_hazard = sw_stable[2];
+    sw_horn = sw_stable[3];
+    sw_headlights = sw_stable[4];
+
+    sw_radio = sw_stable[5];
+    sw_back = sw_stable[6];
+    sw_next = sw_stable[7];
+    sw_ph1 = sw_stable[8];
+    sw_fan = sw_stable[9];
+}
+
+static void Switches_Init(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    sw_pressed_mask = 0U;
+
+    for (uint8_t i = 0U; i < SWITCH_COUNT; i++)
+    {
+        sw_last_raw[i] = Switch_Read(i);
+        sw_stable[i] = sw_last_raw[i];
+        sw_last_change_ms[i] = now;
+
+        if (sw_stable[i])
+        {
+            sw_pressed_mask |= (1UL << i);
+        }
+    }
+
+    Switch_Publish();
+}
+
+/* =====================================================
+ * SWITCH POLLING
+ *
+ * RADIO/PTT IS MOMENTARY, NOT TOGGLE.
+ * ===================================================== */
+
+static void Switches_Poll(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    for (uint8_t i = 0U; i < SWITCH_COUNT; i++)
+    {
+        uint8_t raw = Switch_Read(i);
+
+        if (raw != sw_last_raw[i])
+        {
+            sw_last_raw[i] = raw;
+            sw_last_change_ms[i] = now;
+        }
+
+        if (
+            raw != sw_stable[i] &&
+            (uint32_t)(now - sw_last_change_ms[i]) >=
+                SWITCH_DEBOUNCE_MS
+        )
+        {
+            sw_stable[i] = raw;
+
+            if (raw)
+            {
+                sw_pressed_mask |= (1UL << i);
+
+                sw_press_count[i]++;
+                sw_event_count++;
+
+                sw_last_pressed = (uint32_t)i + 1U;
+
+                /*
+                 * TOGGLE BUTTONS:
+                 *
+                 * 0 LEFT
+                 * 1 RIGHT
+                 * 2 HAZARD
+                 * 4 HEADLIGHT
+                 * 8 PH1
+                 * 9 FAN
+                 *
+                 * RADIO index 5 is excluded.
+                 */
+
+                if (
+                    i == 0U ||
+                    i == 1U ||
+                    i == 2U ||
+                    i == 4U ||
+                    i == 8U ||
+                    i == 9U
+                )
+                {
+                    uint32_t bit = (1UL << i);
+
+                    uint8_t turningOn =
+                        (local_latched_mask & bit) == 0U;
+
+                    if (turningOn && i <= 2U)
+                    {
+                        local_latched_mask &= ~0x7UL;
+                    }
+
+                    if (turningOn)
+                    {
+                        local_latched_mask |= bit;
+                    }
+                    else
+                    {
+                        local_latched_mask &= ~bit;
+                    }
+
+                    if (i <= 2U)
+                    {
+                        TurnCancel_Stop();
+
+                        if (turningOn && i < 2U)
+                        {
+                            TurnCancel_Start(
+                                (uint8_t)(i + 1U)
+                            );
+                        }
+                    }
+                }
+            }
+            else
+            {
+                sw_pressed_mask &= ~(1UL << i);
+            }
+
+            Switch_Publish();
+
+            /*
+             * SEND BOTH PRESS AND RELEASE.
+             *
+             * RADIO:
+             * Press   -> B,...,6,RADIO,1,...
+             * Release -> B,...,6,RADIO,0,...
+             */
+
+            RS485_SendButton(i, raw);
+        }
+    }
+
+    Switch_Publish();
+}
+
+/* =====================================================
+ * IMU SPI
+ * ===================================================== */
+
+static void IMU_Select(void)
+{
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_4,
+        GPIO_PIN_RESET
+    );
+}
+
+static void IMU_Deselect(void)
+{
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_4,
+        GPIO_PIN_SET
+    );
+}
+
+static uint8_t IMU_Read(
+    uint8_t reg,
+    uint8_t *data,
+    uint8_t length
+)
+{
+    uint8_t tx[13] = {0U};
+    uint8_t rx[13] = {0U};
+
+    HAL_StatusTypeDef status;
+
+    if (
+        data == NULL ||
+        length == 0U ||
+        length > 12U
+    )
+    {
+        return 0U;
+    }
+
+    tx[0] = (uint8_t)(reg | 0x80U);
+
+    IMU_Select();
+
+    status = HAL_SPI_TransmitReceive(
+        &hspi1,
+        tx,
+        rx,
+        (uint16_t)(length + 1U),
+        100U
+    );
+
+    IMU_Deselect();
+
+    imu_last_hal_status = (uint32_t)status;
+
+    if (status != HAL_OK)
+    {
+        imu_errors++;
+        return 0U;
+    }
+
+    for (uint8_t i = 0U; i < length; i++)
+    {
+        data[i] = rx[i + 1U];
+    }
+
+    return 1U;
+}
+
+static uint8_t IMU_Write(
+    uint8_t reg,
+    uint8_t value
+)
+{
+    uint8_t tx[2] =
+    {
+        (uint8_t)(reg & 0x7FU),
+        value
+    };
+
+    IMU_Select();
+
+    HAL_StatusTypeDef status =
+        HAL_SPI_Transmit(
+            &hspi1,
+            tx,
+            2U,
+            100U
+        );
+
+    IMU_Deselect();
+
+    imu_last_hal_status = (uint32_t)status;
+
+    if (status != HAL_OK)
+    {
+        imu_errors++;
+        return 0U;
+    }
+
+    return 1U;
+}
+
+static uint8_t IMU_Init(void)
+{
+    uint8_t id = 0U;
+
+    imu_ok = 0U;
+    imu_orientation_valid = 0U;
+    gyro_cal_samples = 0U;
+
+    gyro_bias_sum_x = 0.0f;
+    gyro_bias_sum_y = 0.0f;
+    gyro_bias_sum_z = 0.0f;
+
+    imu_stationary = 0U;
+    imu_yaw_rate_dps = 0.0f;
+    gyro_still_start_ms = 0U;
+    imu_yaw_total_deg = 0.0f;
+
+    if (turn_cancel_side != 0U)
+    {
+        turn_waiting_for_imu = 1U;
+        turn_cancel_armed = 0U;
+    }
+
+    IMU_Deselect();
+    HAL_Delay(20U);
+
+    if (!IMU_Read(IMU_WHO_AM_I_REG, &id, 1U))
+    {
+        return 0U;
+    }
+
+    imu_whoami = id;
+
+    if (id != IMU_EXPECTED_ID)
+    {
+        return 0U;
+    }
+
+    if (
+        !IMU_Write(IMU_CTRL3_C_REG, 0x44U) ||
+        !IMU_Write(IMU_CTRL1_XL_REG, 0x40U) ||
+        !IMU_Write(IMU_CTRL2_G_REG, 0x40U)
+    )
+    {
+        return 0U;
+    }
+
+    HAL_Delay(100U);
+
+    last_orientation_ms = HAL_GetTick();
+
+    imu_ok = 1U;
+
+    return 1U;
+}
+
+static int16_t IMU_Int16(
+    uint8_t lo,
+    uint8_t hi
+)
+{
+    return (int16_t)(
+        (uint16_t)lo |
+        ((uint16_t)hi << 8)
+    );
+}
+
+static uint8_t IMU_ReadMotion(void)
+{
+    uint8_t data[12];
+
+    if (!IMU_Read(IMU_OUTX_L_G_REG, data, 12U))
+    {
+        imu_ok = 0U;
+        imu_orientation_valid = 0U;
+
+        return 0U;
+    }
+
+    imu_gx_raw = IMU_Int16(data[0], data[1]);
+    imu_gy_raw = IMU_Int16(data[2], data[3]);
+    imu_gz_raw = IMU_Int16(data[4], data[5]);
+
+    imu_ax_raw = IMU_Int16(data[6], data[7]);
+    imu_ay_raw = IMU_Int16(data[8], data[9]);
+    imu_az_raw = IMU_Int16(data[10], data[11]);
+
+    imu_ax_g = (float)imu_ax_raw * 0.000061f;
+    imu_ay_g = (float)imu_ay_raw * 0.000061f;
+    imu_az_g = (float)imu_az_raw * 0.000061f;
+
+    imu_gx_dps = (float)imu_gx_raw * 0.00875f;
+    imu_gy_dps = (float)imu_gy_raw * 0.00875f;
+    imu_gz_dps = (float)imu_gz_raw * 0.00875f;
+
+    imu_samples++;
+
+    return 1U;
+}
+
+/* =====================================================
+ * IMU ORIENTATION
+ * ===================================================== */
+
+static void Orientation_Update(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    float accel_roll;
+    float accel_pitch;
+
+    float dt;
+    float gx;
+    float gy;
+    float gz;
+
+    if (gyro_cal_samples < GYRO_CAL_SAMPLES)
+    {
+        gyro_bias_sum_x += imu_gx_dps;
+        gyro_bias_sum_y += imu_gy_dps;
+        gyro_bias_sum_z += imu_gz_dps;
+
+        gyro_cal_samples++;
+
+        if (gyro_cal_samples == GYRO_CAL_SAMPLES)
+        {
+            gyro_bias_x_dps =
+                gyro_bias_sum_x / (float)GYRO_CAL_SAMPLES;
+
+            gyro_bias_y_dps =
+                gyro_bias_sum_y / (float)GYRO_CAL_SAMPLES;
+
+            gyro_bias_z_dps =
+                gyro_bias_sum_z / (float)GYRO_CAL_SAMPLES;
+
+            last_orientation_ms = now;
+        }
+
+        return;
+    }
+
+    accel_roll =
+        atan2f(
+            imu_ay_g,
+            imu_az_g
+        ) * PI_TO_DEG;
+
+    accel_pitch =
+        atan2f(
+            -imu_ax_g,
+            sqrtf(
+                imu_ay_g * imu_ay_g +
+                imu_az_g * imu_az_g
+            )
+        ) * PI_TO_DEG;
+
+    if (!imu_orientation_valid)
+    {
+        imu_roll_deg = accel_roll;
+        imu_pitch_deg = accel_pitch;
+        imu_yaw_deg = 0.0f;
+
+        imu_orientation_valid = 1U;
+        last_orientation_ms = now;
+
+        return;
+    }
+
+    dt =
+        (float)((uint32_t)(now - last_orientation_ms))
+        / 1000.0f;
+
+    last_orientation_ms = now;
+
+    if (dt > 0.10f)
+    {
+        dt = 0.02f;
+    }
+
+    gx = imu_gx_dps - gyro_bias_x_dps;
+    gy = imu_gy_dps - gyro_bias_y_dps;
+    gz = imu_gz_dps - gyro_bias_z_dps;
+
+    imu_roll_deg =
+        0.98f * (imu_roll_deg + gx * dt) +
+        0.02f * accel_roll;
+
+    imu_pitch_deg =
+        0.98f * (imu_pitch_deg + gy * dt) +
+        0.02f * accel_pitch;
+
+    imu_yaw_rate_dps = gz;
+
+    float accel_g =
+        sqrtf(
+            imu_ax_g * imu_ax_g +
+            imu_ay_g * imu_ay_g +
+            imu_az_g * imu_az_g
+        );
+
+    uint8_t looks_still =
+        fabsf(gx) < STILL_GYRO_DPS &&
+        fabsf(gy) < STILL_GYRO_DPS &&
+        fabsf(gz) < STILL_GYRO_DPS &&
+        fabsf(accel_g - 1.0f) < STILL_ACCEL_G_TOL;
+
+    if (looks_still)
+    {
+        if (gyro_still_start_ms == 0U)
+        {
+            gyro_still_start_ms = now;
+        }
+
+        if (
+            (uint32_t)(now - gyro_still_start_ms)
+            >= STILL_CONFIRM_MS
+        )
+        {
+            imu_stationary = 1U;
+
+            gyro_bias_x_dps +=
+                GYRO_BIAS_LEARN_RATE *
+                (imu_gx_dps - gyro_bias_x_dps);
+
+            gyro_bias_y_dps +=
+                GYRO_BIAS_LEARN_RATE *
+                (imu_gy_dps - gyro_bias_y_dps);
+
+            gyro_bias_z_dps +=
+                GYRO_BIAS_LEARN_RATE *
+                (imu_gz_dps - gyro_bias_z_dps);
+        }
+    }
+    else
+    {
+        gyro_still_start_ms = 0U;
+        imu_stationary = 0U;
+    }
+
+    if (
+        !imu_stationary &&
+        fabsf(gz) >= YAW_RATE_DEADBAND_DPS
+    )
+    {
+        float yaw_step = gz * dt;
+
+        imu_yaw_deg += yaw_step;
+        imu_yaw_total_deg += yaw_step;
+    }
+
+    if (imu_yaw_deg > 180.0f)
+    {
+        imu_yaw_deg -= 360.0f;
+    }
+
+    if (imu_yaw_deg < -180.0f)
+    {
+        imu_yaw_deg += 360.0f;
+    }
+}
+
+/* =====================================================
+ * MAIN
+ * ===================================================== */
+
+int main(void)
+{
+    uint32_t last_switch_ms;
+    uint32_t last_imu_ms;
+    uint32_t last_retry_ms;
+
+    uint32_t last_send_ms;
+    uint32_t last_tft_ms;
+    uint32_t splash_start_ms;
+
+    HAL_Init();
+    SystemClock_Config();
+
+    Board_GPIO_Init();
+    Board_SPI1_Init();
+    Board_USART2_Init();
+
+    Switches_Init();
+
+    TFT_Init();
+    TFT_ShowSplash();
+
+    splash_start_ms = HAL_GetTick();
+
+    (void)RS485_Send(
+        "HELIO,WHEEL3,READY\r\n",
+        0U
+    );
+
+    (void)IMU_Init();
+
+    last_switch_ms = HAL_GetTick();
+    last_imu_ms = HAL_GetTick();
+    last_retry_ms = HAL_GetTick();
+
+    last_send_ms = HAL_GetTick();
+    last_tft_ms = HAL_GetTick();
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        RS485_ProcessReceived();
+
+        if (
+            (uint32_t)(now - last_switch_ms)
+            >= SWITCH_SCAN_MS
+        )
+        {
+            last_switch_ms = now;
+            Switches_Poll();
+        }
+
+        if (imu_ok)
+        {
+            if (
+                (uint32_t)(now - last_imu_ms)
+                >= IMU_SAMPLE_MS
+            )
+            {
+                last_imu_ms = now;
+
+                if (IMU_ReadMotion())
+                {
+                    Orientation_Update();
+                    TurnCancel_Update();
+                }
+            }
+        }
+        else if (
+            (uint32_t)(now - last_retry_ms)
+            >= IMU_RETRY_MS
+        )
+        {
+            last_retry_ms = now;
+            (void)IMU_Init();
+        }
+
+        if (
+            (uint32_t)(now - last_send_ms)
+            >= ORIENTATION_SEND_MS
+        )
+        {
+            last_send_ms = now;
+            RS485_SendOrientation();
+        }
+
+        if (
+            !tft_dashboard_ready &&
+            (uint32_t)(now - splash_start_ms)
+            >= TFT_SPLASH_MS
+        )
+        {
+            TFT_DrawStatic();
+            TFT_Refresh();
+
+            last_tft_ms = HAL_GetTick();
+        }
+        else if (
+            tft_dashboard_ready &&
+            (uint32_t)(now - last_tft_ms)
+            >= TFT_REFRESH_MS
+        )
+        {
+            last_tft_ms = now;
+            TFT_Refresh();
+        }
+
+        HAL_Delay(1U);
+    }
+}
+
+/* =====================================================
+ * CLOCK
+ * ===================================================== */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    osc.HSIState = RCC_HSI_ON;
+    osc.HSIDiv = RCC_HSI_DIV1;
+
+    osc.HSICalibrationValue =
+        RCC_HSICALIBRATION_DEFAULT;
+
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    clk.ClockType =
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_PCLK1;
+
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV1;
+
+    if (
+        HAL_RCC_ClockConfig(
+            &clk,
+            FLASH_LATENCY_0
+        ) != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+
+/* =====================================================
+ * GPIO
+ * ===================================================== */
+
+static void Board_GPIO_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+
+    /* MAX3485 receive mode */
+
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_1,
+        GPIO_PIN_RESET
+    );
+
+    /* IMU CS high */
+
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_4,
+        GPIO_PIN_SET
+    );
+
+    /* TFT CS high */
+
+    HAL_GPIO_WritePin(
+        GPIOD,
+        GPIO_PIN_3,
+        GPIO_PIN_SET
+    );
+
+    /* TFT reset and DC high */
+
+    HAL_GPIO_WritePin(
+        GPIOB,
+        GPIO_PIN_9 | GPIO_PIN_15,
+        GPIO_PIN_SET
+    );
+
+    /* PA1 and PA4 outputs */
+
+    gpio.Pin =
+        GPIO_PIN_1 |
+        GPIO_PIN_4;
+
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    /* TFT CS */
+
+    gpio.Pin = GPIO_PIN_3;
+    HAL_GPIO_Init(GPIOD, &gpio);
+
+    /* TFT reset and DC */
+
+    gpio.Pin =
+        GPIO_PIN_9 |
+        GPIO_PIN_15;
+
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    /* Button inputs */
+
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+
+    gpio.Pin =
+        GPIO_PIN_0 |
+        GPIO_PIN_8 |
+        GPIO_PIN_10 |
+        GPIO_PIN_11;
+
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    gpio.Pin =
+        GPIO_PIN_6 |
+        GPIO_PIN_7 |
+        GPIO_PIN_8;
+
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin =
+        GPIO_PIN_6 |
+        GPIO_PIN_14 |
+        GPIO_PIN_15;
+
+    HAL_GPIO_Init(GPIOC, &gpio);
+}
+
+/* =====================================================
+ * SPI1
+ * ===================================================== */
+
+static void Board_SPI1_Init(void)
+{
+    hspi1.Instance = SPI1;
+
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+
+    hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
+    hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+
+    hspi1.Init.BaudRatePrescaler =
+        SPI_BAUDRATEPRESCALER_4;
+
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+
+    hspi1.Init.CRCCalculation =
+        SPI_CRCCALCULATION_DISABLE;
+
+    hspi1.Init.CRCPolynomial = 7U;
+
+    hspi1.Init.NSSPMode =
+        SPI_NSS_PULSE_DISABLE;
+
+    if (HAL_SPI_Init(&hspi1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* =====================================================
+ * USART2 / MAX3485
+ * ===================================================== */
+
+static void Board_USART2_Init(void)
+{
+    huart2.Instance = USART2;
+
+    huart2.Init.BaudRate = UART_BAUD;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+
+    huart2.Init.Mode = UART_MODE_TX_RX;
+
+    huart2.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart2.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+    huart2.Init.OneBitSampling =
+        UART_ONE_BIT_SAMPLE_DISABLE;
+
+    huart2.Init.ClockPrescaler =
+        UART_PRESCALER_DIV1;
+
+    huart2.AdvancedInit.AdvFeatureInit =
+        UART_ADVFEATURE_NO_INIT;
+
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    HAL_NVIC_SetPriority(
+        USART2_IRQn,
+        1U,
+        0U
+    );
+
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
+
+    if (
+        HAL_UART_Receive_IT(
+            &huart2,
+            &rs485_rx_irq_byte,
+            1U
+        ) != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+
+/* =====================================================
+ * ERROR HANDLER
+ * ===================================================== */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+
+    while (1)
+    {
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+
+void assert_failed(
+    uint8_t *file,
+    uint32_t line
+)
+{
+    (void)file;
+    (void)line;
+}
+
+#endif
